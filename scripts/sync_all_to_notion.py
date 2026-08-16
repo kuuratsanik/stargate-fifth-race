@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stargate Fifth Race – Automated Notion Sync (GitHub → Notion upsert by GitHub ID)."""
+"""Stargate Fifth Race – Notion Sync (schema-aware property types)."""
 from __future__ import annotations
 
 import csv
@@ -46,6 +46,7 @@ def template_dir() -> Path:
     candidates = [
         Path("notion-templates"),
         Path(__file__).resolve().parents[1] / "notion-templates",
+        Path(__file__).resolve().parent / "notion-templates",
     ]
     for p in candidates:
         if p.exists():
@@ -54,6 +55,7 @@ def template_dir() -> Path:
 
 
 TEMPLATE_DIR = template_dir()
+_SCHEMA_CACHE: dict[str, dict[str, str]] = {}
 
 
 class Backoff:
@@ -77,11 +79,13 @@ class Backoff:
                 msg = str(e).lower()
                 if attempt >= self.max_attempts:
                     break
+                if "validation_error" in msg or "is expected to be" in msg:
+                    break
                 throttle = any(x in msg for x in ("429", "rate", "throttle", "529", "503"))
                 w = self.wait(attempt, throttle)
                 print(f"[Backoff] attempt {attempt}/{self.max_attempts}: {e} → sleep {w:.2f}s")
                 time.sleep(w)
-        raise RuntimeError(f"Failed after {self.max_attempts} attempts: {last}") from last
+        raise RuntimeError(f"Failed after retries: {last}") from last
 
 
 backoff = Backoff()
@@ -108,10 +112,9 @@ def notify(text: str) -> None:
 def notion_request(method: str, url: str, **kwargs) -> dict:
     r = requests.request(method, url, headers=headers(), timeout=60, **kwargs)
     if r.status_code == 429:
-        ra = r.headers.get("Retry-After", "2")
-        raise RuntimeError(f"rate_limited 429 retry_after={ra}")
+        raise RuntimeError(f"rate_limited 429 retry_after={r.headers.get('Retry-After', '2')}")
     if r.status_code >= 400:
-        raise RuntimeError(f"Notion {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"Notion {r.status_code}: {r.text[:500]}")
     if r.status_code == 204 or not r.content:
         return {}
     return r.json()
@@ -126,131 +129,129 @@ def load_csv(name: str) -> list:
         return list(csv.DictReader(f))
 
 
-def text_prop(value: str) -> dict:
-    return {"rich_text": [{"type": "text", "text": {"content": (value or "")[:2000]}}]}
+def get_schema(database_id: str) -> dict:
+    if database_id in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[database_id]
+    data = backoff.run(lambda: notion_request("GET", f"https://api.notion.com/v1/databases/{database_id}"))
+    props = data.get("properties") or {}
+    schema = {name: (meta.get("type") or "") for name, meta in props.items()}
+    _SCHEMA_CACHE[database_id] = schema
+    print(f"  schema: {len(schema)} properties → {sorted(set(schema.values()))}")
+    return schema
 
 
-def title_prop(value: str) -> dict:
-    return {"title": [{"type": "text", "text": {"content": (value or "Untitled")[:2000]}}]}
-
-
-def select_prop(value: str) -> dict:
-    if not value:
-        return {"select": None}
-    return {"select": {"name": value}}
-
-
-def number_prop(value: Any) -> dict:
-    try:
-        return {"number": int(value)}
-    except (TypeError, ValueError):
+def encode_value(prop_type: str, value: str):
+    value = (value or "").strip()
+    if prop_type == "title":
+        return {"title": [{"type": "text", "text": {"content": (value or "Untitled")[:2000]}}]}
+    if prop_type == "rich_text":
+        return {"rich_text": [{"type": "text", "text": {"content": value[:2000]}}]}
+    if prop_type == "number":
         try:
-            return {"number": float(value)}
-        except (TypeError, ValueError):
+            return {"number": float(value) if "." in value else int(value)}
+        except ValueError:
             return {"number": None}
+    if prop_type == "select":
+        return {"select": {"name": value[:100]} if value else None}
+    if prop_type == "multi_select":
+        if not value:
+            return {"multi_select": []}
+        parts = [p.strip() for p in value.replace(";", ",").split(",") if p.strip()]
+        return {"multi_select": [{"name": p[:100]} for p in parts]}
+    if prop_type == "status":
+        return {"status": {"name": value[:100]} if value else None}
+    if prop_type == "checkbox":
+        return {"checkbox": value.lower() in ("1", "true", "yes", "y")}
+    if prop_type == "url":
+        return {"url": value or None}
+    if prop_type == "email":
+        return {"email": value or None}
+    if prop_type == "date":
+        return {"date": {"start": value} if value else None}
+    return None
 
 
-def row_to_properties(row: dict, kind: str) -> dict:
-    name = row.get("Name") or row.get("Title") or row.get("GitHub ID") or "Untitled"
-    props: dict = {"Name": title_prop(name)}
-    if row.get("GitHub ID"):
-        props["GitHub ID"] = text_prop(row["GitHub ID"])
-    # rich_text fields only — do NOT include Origin/Type (those are select in Notion)
-    text_cols = [
-        "Episode", "Title", "Season Title", "Primary Setting", "Core Technology",
-        "Strategic Milestone", "Notes", "Role / Affiliation", "Arc Summary",
-        "Key Relationships", "Major Seasons", "Dimensions", "Key Systems",
-        "Primary Role", "First Appearance / Notes", "Primary Function",
-        "Key Parameters / Laws", "First Major Use", "Galaxy / System", "Key Features",
-        "Strategic Importance", "Related Episode(s)",
-        "Related Character / Tech / Location", "Resolution Notes",
-    ]
-    for col in text_cols:
-        if col in row and str(row.get(col) or "").strip():
-            props[col] = text_prop(str(row[col]))
-    if "Season" in row and str(row["Season"]).strip().isdigit():
-        props["Season"] = number_prop(row["Season"])
-    if "Duration (min)" in row:
-        props["Duration (min)"] = number_prop(row["Duration (min)"])
-    elif "Duration_Minutes" in row:
-        props["Duration (min)"] = number_prop(row["Duration_Minutes"])
-    for sel in ("Canon Status", "Source", "Status", "Severity", "Origin", "Type"):
-        if sel in row and str(row.get(sel) or "").strip():
-            props[sel] = select_prop(str(row[sel]).strip())
+def row_to_properties(row: dict, schema: dict) -> dict:
+    props = {}
+    title_keys = [k for k, t in schema.items() if t == "title"]
+    title_name = title_keys[0] if title_keys else "Name"
+    title_val = row.get("Name") or row.get("Title") or row.get("GitHub ID") or "Untitled"
+    props[title_name] = encode_value("title", title_val)
+    for col, raw in row.items():
+        if col not in schema or schema[col] == "title":
+            continue
+        if raw is None or str(raw).strip() == "":
+            continue
+        enc = encode_value(schema[col], str(raw))
+        if enc is not None:
+            props[col] = enc
     return props
 
 
-def query_existing_ids(database_id: str, key_prop: str = "GitHub ID") -> dict:
+def query_existing_ids(database_id: str, schema: dict, key_prop: str = "GitHub ID") -> dict:
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    out: dict = {}
-    cursor = None
+    out, cursor = {}, None
     while True:
-        body: dict = {"page_size": 100}
+        body = {"page_size": 100}
         if cursor:
             body["start_cursor"] = cursor
-
-        def _q():
-            return notion_request("POST", url, json=body)
-
-        data = backoff.run(_q)
+        data = backoff.run(lambda: notion_request("POST", url, json=body))
         for page in data.get("results", []):
             props = page.get("properties", {})
-            key_field = props.get(key_prop) or props.get("GitHub ID")
-            gid = ""
-            if key_field:
-                t = key_field.get("type")
-                if t == "rich_text":
-                    gid = "".join(x.get("plain_text", "") for x in (key_field.get("rich_text") or []))
-                elif t == "title":
-                    gid = "".join(x.get("plain_text", "") for x in (key_field.get("title") or []))
+            key_field = props.get(key_prop) or props.get("GitHub ID") or {}
+            gid, t = "", key_field.get("type") or schema.get(key_prop, "rich_text")
+            if t == "rich_text":
+                gid = "".join(x.get("plain_text", "") for x in key_field.get("rich_text") or [])
+            elif t == "title":
+                gid = "".join(x.get("plain_text", "") for x in key_field.get("title") or [])
+            elif t == "select":
+                gid = (key_field.get("select") or {}).get("name") or ""
             if gid:
                 out[gid.strip()] = page["id"]
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
-        time.sleep(0.3)
+        time.sleep(0.25)
     return out
 
 
 def create_page(database_id: str, properties: dict) -> str:
-    def _c():
-        return notion_request(
-            "POST",
-            "https://api.notion.com/v1/pages",
-            json={"parent": {"database_id": database_id}, "properties": properties},
-        )
-    data = backoff.run(_c)
+    data = backoff.run(lambda: notion_request(
+        "POST", "https://api.notion.com/v1/pages",
+        json={"parent": {"database_id": database_id}, "properties": properties},
+    ))
     time.sleep(0.35)
     return data.get("id", "")
 
 
 def update_page(page_id: str, properties: dict) -> None:
-    def _u():
-        return notion_request(
-            "PATCH",
-            f"https://api.notion.com/v1/pages/{page_id}",
-            json={"properties": properties},
-        )
-    backoff.run(_u)
+    backoff.run(lambda: notion_request(
+        "PATCH", f"https://api.notion.com/v1/pages/{page_id}",
+        json={"properties": properties},
+    ))
     time.sleep(0.35)
 
 
 def sync_database(kind: str) -> dict:
     cfg = DATABASES[kind]
-    db_id = cfg["id"]
-    rows = load_csv(cfg["csv"])
+    db_id, rows = cfg["id"], load_csv(cfg["csv"])
     print(f"\n=== Sync {kind} ({cfg['csv']}) ===")
     print(f"  CSV rows: {len(rows)}")
+    empty = {"kind": kind, "csv": len(rows), "created": 0, "updated": 0, "skipped": 0, "errors": 0}
     if not rows:
-        return {"kind": kind, "csv": 0, "created": 0, "updated": 0, "skipped": 0, "errors": 0}
+        return empty
     if not db_id:
-        print(f"  No database id – skip")
-        return {"kind": kind, "csv": len(rows), "created": 0, "updated": 0, "skipped": len(rows), "errors": 0}
+        print("  No database id – skip"); return {**empty, "skipped": len(rows)}
     if DRY_RUN:
         print(f"  DRY_RUN: would upsert {len(rows)} → {db_id[:8]}…")
-        return {"kind": kind, "csv": len(rows), "created": 0, "updated": 0, "skipped": len(rows), "errors": 0, "dry_run": True}
+        return {**empty, "skipped": len(rows), "dry_run": True}
 
-    existing = query_existing_ids(db_id, cfg["key"])
+    schema = get_schema(db_id)
+    missing = set(rows[0].keys()) - set(schema.keys())
+    if missing:
+        print(f"  CSV columns not in Notion schema (skipped): {sorted(missing)}")
+
+    existing = query_existing_ids(db_id, schema, cfg["key"])
     print(f"  Existing with GitHub ID: {len(existing)}")
     created = updated = skipped = errors = 0
     for row in rows:
@@ -259,7 +260,7 @@ def sync_database(kind: str) -> dict:
             skipped += 1
             continue
         try:
-            props = row_to_properties(row, kind)
+            props = row_to_properties(row, schema)
             if gid in existing:
                 update_page(existing[gid], props)
                 updated += 1
@@ -274,18 +275,12 @@ def sync_database(kind: str) -> dict:
 
 
 def main() -> int:
-    print("Stargate Fifth Race – Notion Sync")
+    print("Stargate Fifth Race – Notion Sync (schema-aware)")
     print(f"DRY_RUN={DRY_RUN} TEMPLATE_DIR={TEMPLATE_DIR}")
     print(f"TARGETS={TARGETS} TOKEN={bool(TOKEN)}")
     if not TOKEN and not DRY_RUN:
-        notify("Canon sync aborted – missing NOTION_TOKEN")
-        return 1
-    results = []
-    for kind in TARGETS:
-        if kind in DATABASES:
-            results.append(sync_database(kind))
-        else:
-            print(f"Unknown target: {kind}")
+        notify("Canon sync aborted – missing NOTION_TOKEN"); return 1
+    results = [sync_database(k) for k in TARGETS if k in DATABASES]
     c = sum(r.get("created", 0) for r in results)
     u = sum(r.get("updated", 0) for r in results)
     e = sum(r.get("errors", 0) for r in results)
