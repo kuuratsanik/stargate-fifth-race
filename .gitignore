@@ -1,0 +1,6 @@
+secrets.env
+secrets.env.save
+.venv/
+.~lock.*
+*.pyc
+__pycache__/
