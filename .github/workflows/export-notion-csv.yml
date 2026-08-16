@@ -1,0 +1,64 @@
+name: Export Notion to CSV
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_back:
+        description: "Commit CSVs back to main"
+        type: boolean
+        default: true
+      export_only:
+        description: "Optional filter e.g. Episodes.csv"
+        type: string
+        default: ""
+  schedule:
+    - cron: "0 5 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Export Notion → CSV
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_EPISODES_DATA_SOURCE_ID: ${{ secrets.NOTION_EPISODES_DATA_SOURCE_ID }}
+          NOTION_CHARACTERS_DATA_SOURCE_ID: ${{ secrets.NOTION_CHARACTERS_DATA_SOURCE_ID }}
+          NOTION_SHIPS_DATA_SOURCE_ID: ${{ secrets.NOTION_SHIPS_DATA_SOURCE_ID }}
+          NOTION_TECH_DATA_SOURCE_ID: ${{ secrets.NOTION_TECH_DATA_SOURCE_ID }}
+          NOTION_LOCATIONS_DATA_SOURCE_ID: ${{ secrets.NOTION_LOCATIONS_DATA_SOURCE_ID }}
+          NOTION_CONTINUITY_DATA_SOURCE_ID: ${{ secrets.NOTION_CONTINUITY_DATA_SOURCE_ID }}
+          EXPORT_DIR: notion-templates
+          EXPORT_ONLY: ${{ github.event.inputs.export_only || '' }}
+        run: python scripts/export_notion_to_csv.py
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: notion-csv-export
+          path: notion-templates/*.csv
+          if-no-files-found: error
+
+      - name: Commit CSVs to repo
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.commit_back == 'true' || github.event.inputs.commit_back == true }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add notion-templates/*.csv
+          if git diff --staged --quiet; then
+            echo "No CSV changes to commit"
+          else
+            git commit -m "chore: export Notion CSVs $(date -u +%Y-%m-%d)"
+            git push
+          fi
