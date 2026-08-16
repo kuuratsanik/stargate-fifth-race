@@ -46,8 +46,6 @@ def template_dir() -> Path:
     candidates = [
         Path("notion-templates"),
         Path(__file__).resolve().parents[1] / "notion-templates",
-        Path("/home/workdir/artifacts/Expanded_Materials/notion-templates"),
-        Path("/home/workdir/artifacts/github_upload_pack/notion-templates"),
     ]
     for p in candidates:
         if p.exists():
@@ -81,11 +79,6 @@ class Backoff:
                     break
                 throttle = any(x in msg for x in ("429", "rate", "throttle", "529", "503"))
                 w = self.wait(attempt, throttle)
-                if "retry_after=" in msg:
-                    try:
-                        w = max(w, float(msg.split("retry_after=")[1].split()[0]))
-                    except Exception:
-                        pass
                 print(f"[Backoff] attempt {attempt}/{self.max_attempts}: {e} → sleep {w:.2f}s")
                 time.sleep(w)
         raise RuntimeError(f"Failed after {self.max_attempts} attempts: {last}") from last
@@ -162,11 +155,12 @@ def row_to_properties(row: dict, kind: str) -> dict:
     props: dict = {"Name": title_prop(name)}
     if row.get("GitHub ID"):
         props["GitHub ID"] = text_prop(row["GitHub ID"])
+    # rich_text fields only — do NOT include Origin/Type (those are select in Notion)
     text_cols = [
         "Episode", "Title", "Season Title", "Primary Setting", "Core Technology",
         "Strategic Milestone", "Notes", "Role / Affiliation", "Arc Summary",
-        "Key Relationships", "Major Seasons", "Type", "Dimensions", "Key Systems",
-        "Primary Role", "First Appearance / Notes", "Origin", "Primary Function",
+        "Key Relationships", "Major Seasons", "Dimensions", "Key Systems",
+        "Primary Role", "First Appearance / Notes", "Primary Function",
         "Key Parameters / Laws", "First Major Use", "Galaxy / System", "Key Features",
         "Strategic Importance", "Related Episode(s)",
         "Related Character / Tech / Location", "Resolution Notes",
@@ -180,7 +174,7 @@ def row_to_properties(row: dict, kind: str) -> dict:
         props["Duration (min)"] = number_prop(row["Duration (min)"])
     elif "Duration_Minutes" in row:
         props["Duration (min)"] = number_prop(row["Duration_Minutes"])
-    for sel in ("Canon Status", "Source", "Status", "Severity"):
+    for sel in ("Canon Status", "Source", "Status", "Severity", "Origin", "Type"):
         if sel in row and str(row.get(sel) or "").strip():
             props[sel] = select_prop(str(row[sel]).strip())
     return props
