@@ -1,0 +1,51 @@
+name: Sync Canon to Notion (v2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no writes)"
+        type: boolean
+        default: true
+  push:
+    paths:
+      - "00-canon/**"
+      - "notion-templates/**"
+      - "scripts/**"
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate canon
+        run: python scripts/validate_canon_v2.py
+
+  sync:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_EPISODES_DATA_SOURCE_ID: ${{ secrets.NOTION_EPISODES_DATA_SOURCE_ID }}
+          NOTION_CHARACTERS_DATA_SOURCE_ID: ${{ secrets.NOTION_CHARACTERS_DATA_SOURCE_ID }}
+          NOTION_SHIPS_DATA_SOURCE_ID: ${{ secrets.NOTION_SHIPS_DATA_SOURCE_ID }}
+          NOTION_TECH_DATA_SOURCE_ID: ${{ secrets.NOTION_TECH_DATA_SOURCE_ID }}
+          NOTION_LOCATIONS_DATA_SOURCE_ID: ${{ secrets.NOTION_LOCATIONS_DATA_SOURCE_ID }}
+          NOTION_CONTINUITY_DATA_SOURCE_ID: ${{ secrets.NOTION_CONTINUITY_DATA_SOURCE_ID }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: python scripts/sync_all_to_notion.py
