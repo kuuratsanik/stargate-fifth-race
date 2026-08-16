@@ -1,0 +1,17 @@
+---
+
+name: Run Awk Script
+on: push
+
+jobs:
+  grawk:
+    name: Run Grawk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Grawk
+        uses: norwd/grawk@v1
+        with:
+          program: |
+            BEGIN {
+              print "Hello World!"
+            }
